@@ -1,0 +1,39 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+*.onnx
+*.pt
+*.mp4
+*.avi
+
+# Local Rust toolchain (cargo/rustup homes) and build helpers
+.toolchains/
+
+# Build outputs
+predictions/
+target/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+deployment/tauri_yolo_release
+src/App_21_05_2026.tsx
+.toolchains

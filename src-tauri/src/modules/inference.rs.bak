@@ -1,0 +1,302 @@
+use crate::modules::drawing::{
+    draw_detection, draw_detection_with_mask, draw_motion_overlays, include_font,
+};
+use crate::modules::image_utils::{is_image, load_and_preprocess_image};
+use crate::modules::models::{Detection, SegInferenceResult};
+use crate::modules::video_utils::{find_motion_pixel, is_video, preprocess_frame, BBox};
+use rayon::prelude::*;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tauri::Emitter;
+use tokio::task;
+use tract_onnx::prelude::tract_ndarray::{Axis, Ix3};
+use tract_onnx::prelude::*;
+use uuid::Uuid;
+use walkdir::WalkDir;
+
+use crate::modules::video_utils::{find_motion_pixel, is_video, preprocess_frame};
+use std::path::Path;
+
+pub fn process_input_source(path_str: &str) {
+    let path = Path::new(path_str);
+
+    if is_video(path) {
+        // 1. Execute the motion tracker to isolate a dynamic frame window
+        if let Some((motion_boxes, raw_gray_frame)) = find_motion_pixel(path, 3, -1, 5, 30) {
+            // Convert grayscale frame back to dynamic container for resizing pipelines
+            let dynamic_frame = DynamicImage::ImageLuma8(raw_gray_frame);
+
+            // 2. Run our letterbox calculation
+            let preprocessed = preprocess_frame(&dynamic_frame, 640);
+
+            // 3. Forward preprocessed.tensor_image down into your YOLO inference runtime...
+            // 4. Pass 'motion_boxes' along to the visualizer module described in step 3!
+        }
+    } else {
+        // Fallback: Legacy simple image reader logic if needed
+        let img = image::open(path).expect("Failed to parse flat image asset");
+        let preprocessed = preprocess_frame(&img, 640);
+    }
+}
+
+#[tauri::command]
+pub async fn run_inference(
+    input_dir: String,
+    od_model_path: String,
+    seg_model_path: String,
+    conf_threshold: f32,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let input_path = PathBuf::from(&input_dir);
+    let output_dir = input_path
+        .parent()
+        .unwrap_or(&input_path)
+        .join("predictions");
+
+    std::fs::create_dir_all(&output_dir).map_err(|e| e.to_string())?;
+    let app = app_handle.clone();
+
+    task::spawn_blocking(move || {
+        let _ = app.emit("log_event", "Loading Object Detection Model...");
+        let od_model = match tract_onnx::onnx()
+            .model_for_path(&od_model_path)
+            .and_then(|m| m.with_input_fact(0, f32::fact(&[1, 3, 640, 640]).into()))
+            .and_then(|m| m.into_optimized())
+            .and_then(|m| m.into_runnable())
+        {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                let _ = app.emit("log_event", format!("Failed to load OD model: {:?}", e));
+                return;
+            }
+        };
+
+        let _ = app.emit("log_event", "Loading Segmentation Model...");
+        let seg_model = match tract_onnx::onnx()
+            .model_for_path(&seg_model_path)
+            .and_then(|m| m.with_input_fact(0, f32::fact(&[1, 3, 640, 640]).into()))
+            .and_then(|m| m.into_optimized())
+            .and_then(|m| m.into_runnable())
+        {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                let _ = app.emit("log_event", format!("Failed to load SEG model: {:?}", e));
+                return;
+            }
+        };
+
+        let image_paths: Vec<PathBuf> = WalkDir::new(&input_path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| is_image(e.path()))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+
+        let _ = app.emit(
+            "log_event",
+            format!("Found {} images for inference.", image_paths.len()),
+        );
+
+        image_paths.par_iter().for_each(|path| {
+            let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+            let _ = app.emit("log_event", format!("Processing: {}", file_name));
+            let unique_id = Uuid::new_v4().to_string();
+
+            if let Ok(prep) = load_and_preprocess_image(path, 640) {
+                let original_canvas = prep.original_img.to_rgb8();
+                let od_model_clone = od_model.clone();
+                let seg_model_clone = seg_model.clone();
+                let mut od_duration_ms = 0;
+                let mut seg_duration_ms = 0;
+
+                let (od_result, seg_result) = rayon::join(
+                    || {
+                        let start_od = std::time::Instant::now();
+                        let detections = run_od_inference(
+                            &od_model_clone,
+                            prep.input_tensor.clone(),
+                            conf_threshold,
+                            prep.orig_w,
+                            prep.orig_h,
+                            prep.scale,
+                            prep.pad_x,
+                            prep.pad_y,
+                        )
+                        .unwrap_or_default();
+
+                        od_duration_ms = start_od.elapsed().as_millis();
+
+                        let mut canvas = original_canvas.clone();
+                        for det in &detections {
+                            draw_detection(&mut canvas, det, include_font());
+                        }
+
+                        let od_path = output_dir.join(format!("od_{}.jpg", unique_id));
+                        canvas.save(&od_path).ok().map(|_| od_path)
+                    },
+                    || {
+                        let start_seg = std::time::Instant::now();
+                        if let Ok(seg_res) = run_seg_inference(
+                            &seg_model_clone,
+                            prep.input_tensor.clone(),
+                            conf_threshold,
+                            prep.orig_w,
+                            prep.orig_h,
+                            prep.scale,
+                            prep.pad_x,
+                            prep.pad_y,
+                        ) {
+                            seg_duration_ms = start_seg.elapsed().as_millis();
+
+                            let mut canvas = original_canvas.clone();
+                            for det in &seg_res.detections {
+                                draw_detection_with_mask(
+                                    &mut canvas,
+                                    det,
+                                    include_font(),
+                                    &seg_res.proto_masks,
+                                );
+                            }
+                            let seg_path = output_dir.join(format!("seg_{}.jpg", unique_id));
+                            canvas.save(&seg_path).ok().map(|_| seg_path)
+                        } else {
+                            None
+                        }
+                    },
+                );
+
+                if let (Some(od_p), Some(seg_p)) = (od_result, seg_result) {
+                    let _ = app.emit(
+                        "image_event",
+                        serde_json::json!({
+                            "bbox": od_p.to_string_lossy().to_string(),
+                            "mask": seg_p.to_string_lossy().to_string(),
+                            "odTime": od_duration_ms,
+                            "segTime": seg_duration_ms
+                        }),
+                    );
+                }
+            } else {
+                let _ = app.emit(
+                    "log_event",
+                    format!("Failed preprocessing for {}", file_name),
+                );
+            }
+        });
+
+        let _ = app.emit("log_event", "🎉 Inference execution complete!");
+    });
+
+    Ok(())
+}
+
+fn run_od_inference(
+    model: &RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+    input_tensor: Tensor,
+    conf_threshold: f32,
+    orig_w: u32,
+    orig_h: u32,
+    scale: f32,
+    pad_x: u32,
+    pad_y: u32,
+) -> TractResult<Vec<Detection>> {
+    let result = model.run(tvec!(input_tensor.into()))?;
+    let output = result[0].to_array_view::<f32>()?;
+    let detections = output.index_axis(Axis(0), 0);
+
+    let mut final_detections = Vec::new();
+
+    for i in 0..detections.shape()[0] {
+        let score = detections[[i, 4]];
+        if score < conf_threshold {
+            continue;
+        }
+
+        let class_id = detections[[i, 5]] as usize;
+
+        let mut x1 = (detections[[i, 0]] - pad_x as f32) / scale;
+        let mut y1 = (detections[[i, 1]] - pad_y as f32) / scale;
+        let mut x2 = (detections[[i, 2]] - pad_x as f32) / scale;
+        let mut y2 = (detections[[i, 3]] - pad_y as f32) / scale;
+
+        x1 = x1.clamp(0.0, orig_w as f32);
+        y1 = y1.clamp(0.0, orig_h as f32);
+        x2 = x2.clamp(0.0, orig_w as f32);
+        y2 = y2.clamp(0.0, orig_h as f32);
+
+        final_detections.push(Detection {
+            x1,
+            y1,
+            x2,
+            y2,
+            score,
+            class_id,
+            mask_coefficients: None,
+        });
+    }
+
+    Ok(final_detections)
+}
+
+fn run_seg_inference(
+    model: &RunnableModel<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>,
+    input_tensor: Tensor,
+    conf_threshold: f32,
+    orig_w: u32,
+    orig_h: u32,
+    scale: f32,
+    pad_x: u32,
+    pad_y: u32,
+) -> TractResult<SegInferenceResult> {
+    let result = model.run(tvec!(input_tensor.into()))?;
+
+    let boxes_raw = result[0].to_array_view::<f32>()?;
+    let masks_raw = result[1].to_array_view::<f32>()?;
+
+    let boxes = boxes_raw.index_axis(Axis(0), 0);
+    let proto_masks = masks_raw
+        .index_axis(Axis(0), 0)
+        .into_dimensionality::<Ix3>()?
+        .to_owned();
+
+    let mut detections = Vec::new();
+
+    for i in 0..boxes.shape()[0] {
+        let score = boxes[[i, 4]];
+        if score < conf_threshold {
+            continue;
+        }
+
+        let class_id = boxes[[i, 5]] as usize;
+
+        let mut x1 = (boxes[[i, 0]] - pad_x as f32) / scale;
+        let mut y1 = (boxes[[i, 1]] - pad_y as f32) / scale;
+        let mut x2 = (boxes[[i, 2]] - pad_x as f32) / scale;
+        let mut y2 = (boxes[[i, 3]] - pad_y as f32) / scale;
+
+        x1 = x1.clamp(0.0, orig_w as f32);
+        y1 = y1.clamp(0.0, orig_h as f32);
+        x2 = x2.clamp(0.0, orig_w as f32);
+        y2 = y2.clamp(0.0, orig_h as f32);
+
+        let mut mask_coefficients = [0.0f32; 32];
+        for coeff_idx in 0..32 {
+            mask_coefficients[coeff_idx] = boxes[[i, 6 + coeff_idx]];
+        }
+
+        detections.push(Detection {
+            x1,
+            y1,
+            x2,
+            y2,
+            score,
+            class_id,
+            mask_coefficients: Some(mask_coefficients),
+        });
+    }
+
+    Ok(SegInferenceResult {
+        detections,
+        proto_masks,
+    })
+}

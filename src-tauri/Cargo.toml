@@ -1,0 +1,62 @@
+[package]
+name = "tauri_yolo"
+default-run = "tauri_yolo_release"
+version = "0.1.0"
+authors = ["Mike Polinowski <mpolinowski@gmail.com>"]
+description = "YOLOv26 inference tool."
+license = "MIT"
+repository = "https://github.com/mpolinowski/tauri_yolo"
+readme = "README.md"
+keywords = ["tauri", "react", "yolo", "inference"]
+edition = "2021"
+rust-version = "1.77.2"
+
+# Optimize dependencies even in debug/dev mode
+# [profile.dev.package.tract-onnx]
+# opt-level = 3
+# [profile.dev.package.tract-core]
+# opt-level = 3
+# [profile.dev.package.image]
+# opt-level = 3
+# [profile.dev.package.rayon]
+# opt-level = 3
+# OPTIMIZE EVERYTHING
+[profile.dev.package."*"]
+opt-level = 3
+# https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "tauri_yolo"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "tauri_yolo_release"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+# statically link ffmpeg for video-rs!
+video-rs = { version = "0.11.0", features = ["ndarray"] }
+ffmpeg-next = { version = "8.0", features = ["static", "build"] }
+image = "0.25"
+imageproc = "0.26"
+ndarray = "0.15"
+log = "0.4"
+once_cell = "1"
+rayon = "1.7"
+rusttype = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11.2", features = ["protocol-asset"] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2.0"
+tokio = "1.52.3"
+tract-tflite = "0.22.1"
+tract-onnx = "0.22.1"
+walkdir = "2.4"
+uuid = { version = "1.0", features = ["v4"] }
+ab_glyph = "0.2.32"
+anyhow = "1.0.102"
