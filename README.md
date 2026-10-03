@@ -6,7 +6,7 @@ Built with [Tauri 2](https://tauri.app) as the application shell:
 
 a lightweight Rust core (`src-tauri`) does all the heavy lifting, and a React 19 / TypeScript / Vite frontend (`src`) talks to it over Tauri's typed command/event IPC.
 
-![INSTAR Object Detector UI screenshot](./public/INSTAR_Object_Detector_02.png)
+![INSTAR Object Detector UI screenshot](./public/INSTAR_Object_Detector_02.webp)
 
 > The UI let's you select both a e.g. YOLOv10 or YOLO26 object detection and segmentation model and batch runs all you input videos through them in paralell. The `teal coloured` are areas where motion was detected. The rest are bounding boxes and segmentation masks for detected objects.
 
@@ -109,7 +109,7 @@ cd deployment
 ./tauri_yolo_release
 ```
 
-![INSTAR Object Detector UI screenshot](./public/INSTAR_Object_Detector_01.png)
+![INSTAR Object Detector UI screenshot](./public/INSTAR_Object_Detector_01.webp)
 
 ### 6. Drive the UI
 
@@ -195,7 +195,7 @@ tract_onnx::onnx().model_for_path(path)?
 
 1. **Raw / pre-NMS** (e.g. `yolo26n.onnx` → `[1, 84, 8400]`, seg → `[1, 116, 8400]` + `[1, 32, 160, 160]`): feature-major with 8400 anchors — rows `0..4` are `center-x, center-y, w, h`, next `nc` rows class confidences, (seg:) final 32 rows mask coefficients. The parser picks the argmax class per anchor, thresholds it, converts `cxcywh → xyxy`, and runs an **in-app greedy NMS** (IoU `0.45`, capped at 300 boxes).
 2. **End-to-end / NMS-baked-in** (e.g. `[1, 300, 6]`; fine-tuned instar models): one row per detection `[x1, y1, x2, y2, score, class_id]` — no NMS needed.
-3. **Coordinate spaces inside e2e outputs differ between model families:** NMS-free **YOLOv10** exports emit xyxy *normalized to `[0, 1]`* over the original image, while the fine-tuned **YOLO26** e2e exports emit *absolute pixels in a plain-resized 640×640 input square* (the fine-tune pipeline resizes the frame non-aspect-preserving, so the axes must be scaled back independently: `x·orig_w/640`, `y·orig_h/640`). The parser auto-detects which by the tensor magnitude: `max_coord > 1.5` ⇒ pixel space (per-axis rescale by the original dimensions); otherwise ⇒ normalized (multiply the coordinate by `orig_w` / `orig_h`). A single model run therefore works on any mix of the supported exports without configuration.
+3. **Coordinate spaces inside e2e outputs differ between model families — but they all refer to the *letterboxed* 640×640 input, never to the original image** (a model that only ever sees the 640 square cannot know the original size): fine-tuned **YOLO26** e2e exports emit xyxy directly *in 640-letterbox pixels*, while the NMS-free **YOLOv10** / static exports emit the *same* letterbox xyxy pre-normalized to `[0, 1]` (÷640). The parser auto-detects which by the tensor magnitude (`max_coord > 1.5` ⇒ pixel space), maps normalized coordinates back with `×640`, and then un-letterboxes both cases with the recorded `(scale, pad)` triple — `(v − pad)/scale` — exactly like the raw branch. This was verified empirically against the letterbox-space COCO reference: on a 3840×2182 frame the fine-tuned pixel e2e model reports a person at `[313.9, 230.3, 399.4, 436.7]` where the COCO raw model reports `[313.7, 231.2, 400.5, 437.7]` (IoU ≈ 0.98 after decoding), and the yolov10s normalized e2e model reports the same car at `≈[0.379, 0.326, 0.877, 0.611]` (×640) where COCO reports `[240, 208, 560, 394]`. A single model run therefore works on any mix of the supported exports without configuration.
 
 Layout discrimination between (1) and (2) is structural: raw exports have few feature rows than anchor columns, e2e outputs have N detection rows and 6/38 columns.
 

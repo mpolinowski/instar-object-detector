@@ -23,6 +23,14 @@ use walkdir::WalkDir;
 /// Maximum number of detections kept per model run (after NMS for raw layouts).
 const MAX_DETECTIONS: usize = 300;
 
+/// Fixed model input size: this app always feeds 640x640 letterboxed images
+/// (see `load_and_preprocess_image` and `preprocess_frame`), and all model
+/// families in use — stock Ultralytics and the fine-tuned instar models,
+/// pixel and normalized e2e variants alike — define their output
+/// coordinates relative to that 640x640 letterbox input (see
+/// `parse_od_output`).
+const INPUT_SIZE: f32 = 640.0;
+
 /// IoU threshold used when NMS is applied by this app (raw, pre-NMS model outputs).
 const NMS_IOU_THRESHOLD: f32 = 0.45;
 
@@ -116,12 +124,17 @@ fn nms_inplace(detections: &mut Vec<Detection>) {
 ///
 ///  2. "End-to-end (NMS baked in)" : shape (N, 6) with N detections (e.g.
 ///     300). Row-major: [x1, y1, x2, y2, score, class_id] per row.
-///     Two coordinate spaces occur in the wild:
-///       - pixel space: xyxy in the 640x640 letterbox input (the fine-tuned
-///         YOLO26 e2e exports), un-letterboxed via `to_image_space`;
-///       - normalized [0..1] xyxy relative to the *original* image (the
-///         NMS-free YOLOv10 e2e exports), scaled by (orig_w, orig_h).
-///     They are discriminated by magnitude (see the e2e branch below).
+///     xyxy is ALWAYS relative to the 640x640 letterbox input, emitted two
+///     ways (discriminated by magnitude, see the e2e branch below):
+///       - pixel space: xyxy in 640-letterbox pixels (fine-tuned YOLO26
+///         e2e exports);
+///       - normalized [0..1]: the SAME letterbox xyxy pre-divided by 640
+///         (yolov10s / static e2e exports). A model that only receives the
+///         640 square cannot know the original image size, so the
+///         normalized form is relative to the letterbox, never the
+///         original image.
+///     Both are decoded with the recorded (scale, pad) triple, exactly like
+///     the raw branch.
 ///
 /// Heuristic distinction: raw outputs have far more anchors than features,
 /// so rows < cols for raw and rows > cols for end-to-end outputs.
@@ -172,12 +185,19 @@ fn parse_od_output(
         nms_inplace(&mut final_detections);
         final_detections
     } else {
-        // Coordinates are either 640-letterbox pixels or normalized [0,1]
-        // over the original image — detect by max magnitude.
+        // All e2e boxes are xyxy relative to the 640x640 LETTERBOXED model
+        // input — never to the original image (a model that receives only
+        // the 640 square cannot know the original size):
+        //   - pixel exports emit letterbox pixels directly;
+        //   - normalized exports pre-divide the SAME letterbox coords by 640.
+        // Measured on screenshot.png (3840x2182) against the letterbox-space
+        // COCO reference: the same person decodes to [313.9,230.3,399.4,436.7]
+        // (fine-tuned pixel e2e) vs [313.7,231,400.5,437.7] (COCO raw), and
+        // the same car to [0.379,0.326,0.877,0.611]*640 (fine-tuned
+        // normalized e2e) vs [240,208,560,394] (COCO raw).
         //
-        // Normalized coordinates are ≤ 1.0 by definition. Pixel-space coords
-        // are ≥ ~10 px because models don't emit sub-2px boxes with any
-        // confidence, so if the max coord is > 1.5, we're in pixel space.
+        // Normalized coords are ≤ 1.0 by definition, pixel coords are tens
+        // of px at least — the max magnitude discriminates the two.
         let mut max_coord = 0.0f32;
         for i in 0..rows {
             for c in 0..4 {
@@ -185,22 +205,14 @@ fn parse_od_output(
             }
         }
         let normalized = max_coord <= 1.5;
-        // The input square is `max(orig_w, orig_h) * scale` (640 in this app).
-        let input_size =
-            ((orig_w as f32 * scale).max(orig_h as f32 * scale)).max(1.0);
 
-        // Two pixel conventions occur in the wild:
-        //  - fine-tuned e2e exports were trained on a plain resize of the
-        //    frame into the 640 square (aspect NOT preserved): coordinates
-        //    map back with a per-axis scale (x * orig_w / 640, y * orig_h / 640);
-        //  - normalized exports are the same idea but pre-normalized to [0,1].
+        // Map into 640-letterbox space, then un-letterbox with the recorded
+        // (scale, pad) triple — identical to the raw branch.
         let to_img = |v: f32, horiz: bool| -> f32 {
-            let bound = (if horiz { orig_w } else { orig_h }) as f32;
-            if normalized {
-                v.clamp(0.0, 1.0) * bound
-            } else {
-                v.clamp(0.0, input_size) * bound / input_size
-            }
+            let lb = if normalized { v.clamp(0.0, 1.0) * INPUT_SIZE } else { v };
+            let pad = if horiz { pad_x } else { pad_y };
+            let bound = if horiz { orig_w } else { orig_h };
+            to_image_space(lb, pad, scale, bound)
         };
 
         (0..rows)
@@ -292,7 +304,7 @@ fn parse_seg_output(
 
     if rows < cols {
         // Raw / pre-NMS layout: (4 + nc + 32, A)
-        //   rows 0..4        : box (x1, y1, x2, y2)
+        //   rows 0..4        : box (center-x, center-y, width, height)
         //   rows 4..(4+nc)   : class confidences (one row per class)
         //   rows (4+nc)..end : 32 mask coefficients
         let n_coeff = rows - 4;
@@ -343,10 +355,14 @@ fn parse_seg_output(
         // End-to-end layout: (N, 6 + 32)
         //   [x1, y1, x2, y2, score, class_id, coeff_0 .. coeff_31]
         //
-        // Coordinates may be normalized [0..1] over the original image
-        // (NMS-free YOLOv10 e2e), or pixels in the fine-tune's plain-resize
-        // 640 square. The magnitude heuristic is identical to
-        // `parse_od_output`; see that e2e branch for full details.
+        // x1..y2 are relative to the 640x640 letterbox input (pixel e2e
+        // exports emit letterbox pixels; normalized exports pre-divide the
+        // same letterbox coords by 640). Same convention as OD — see the
+        // e2e branch of `parse_od_output` for details and measurements.
+        // The mask prototype grid is in the same letterbox space (verified:
+        // COCO and fine-tuned seg models localize the same person at grid
+        // rows ~50-110 for a box at lb-rows 58-109), which is exactly what
+        // `draw_detection_with_mask` samples.
         let mut max_coord = 0.0f32;
         for i in 0..rows {
             for c in 0..4 {
@@ -354,16 +370,12 @@ fn parse_seg_output(
             }
         }
         let normalized = max_coord <= 1.5;
-        let input_size =
-            ((orig_w as f32 * scale).max(orig_h as f32 * scale)).max(1.0);
 
         let to_img = |v: f32, horiz: bool| -> f32 {
-            let bound = (if horiz { orig_w } else { orig_h }) as f32;
-            if normalized {
-                v.clamp(0.0, 1.0) * bound
-            } else {
-                v.clamp(0.0, input_size) * bound / input_size
-            }
+            let lb = if normalized { v.clamp(0.0, 1.0) * INPUT_SIZE } else { v };
+            let pad = if horiz { pad_x } else { pad_y };
+            let bound = if horiz { orig_w } else { orig_h };
+            to_image_space(lb, pad, scale, bound)
         };
 
         for i in 0..rows {
@@ -1044,10 +1056,11 @@ names:
     }
 
     #[test]
-    fn od_e2e_normalized_coords_scale_to_image_dimensions() {
-        // NMS-free YOLOv10-style e2e exports emit xyxy normalized to [0,1]
-        // over the original image; the parser must scale by the image dims
-        // rather than un-letterbox them.
+    fn od_e2e_normalized_coords_are_letterbox_over_640() {
+        // e2e exports may emit xyxy normalized into [0,1] — but relative to
+        // the 640x640 LETTERBOXED input, not the original image: a model
+        // receiving only the 640 square cannot know the original size. So
+        // decoding is `v * 640 -> (v - pad) / scale`, not `v * orig_dim`.
         // rows must be > cols so this is recognized as "end-to-end"
         // (real e2e exports look like [300, 6]).
         let mut det = Array2::<f32>::zeros((9, 6));
@@ -1067,10 +1080,41 @@ names:
         assert_eq!(dets.len(), 1);
         assert_eq!(dets[0].class_id, 1);
         assert!((dets[0].score - 0.97).abs() < 1e-6);
-        assert!((dets[0].x1 - 0.2376 * 1280.0).abs() < 1e-3);
-        assert!((dets[0].y1 - 0.2415 * 720.0).abs() < 1e-3);
-        assert!((dets[0].x2 - 0.8541 * 1280.0).abs() < 1e-3);
-        assert!((dets[0].y2 - 0.5467 * 720.0).abs() < 1e-3);
+        // letterbox coords: [152.064, 154.56, 546.624, 349.888]
+        assert!((dets[0].x1 - 152.064 / 0.5).abs() < 1e-3); // 304.128
+        assert!((dets[0].y1 - (154.56 - 140.0) / 0.5).abs() < 1e-3); // 29.12
+        assert!((dets[0].x2 - 546.624 / 0.5).abs() < 1e-3); // 1093.248
+        assert!((dets[0].y2 - (349.888 - 140.0) / 0.5).abs() < 1e-3); // 419.776
+    }
+
+    #[test]
+    fn od_e2e_pixel_coords_unletterbox_like_raw_outputs() {
+        // Real-world check: YOLO26n-seg-motion (fine-tuned, e2e pixel
+        // variant) reports the person in screenshot.png (3840x2182) as
+        // [313.9, 230.3, 399.4, 436.7] in letterbox-pixel space — the same
+        // object the letterbox-space COCO model reports as
+        // [313.7, 231.2, 400.5, 437.7]. Both must decode to nearly the same
+        // original-space box, so the e2e box must be un-letterboxed with
+        // (v - pad) / scale exactly like the raw branch.
+        let mut det = Array2::<f32>::zeros((9, 6));
+        det[[0, 0]] = 313.9;
+        det[[0, 1]] = 230.3;
+        det[[0, 2]] = 399.4;
+        det[[0, 3]] = 436.7;
+        det[[0, 4]] = 0.97;
+        det[[0, 5]] = 0.0;
+        det[[1, 4]] = 0.01; // below threshold
+
+        // 3840x2182: scale 1/6, pad_x 0, pad_y 138.
+        let dets = parse_od_output(det.view(), CONF, 3840, 2182, 1.0 / 6.0, 0, 138);
+
+        assert_eq!(dets.len(), 1);
+        let d = &dets[0];
+        // Expected original space: x [1883.4, 2396.4], y [553.8, 1792.2]
+        assert!((d.x1 - 1883.4).abs() < 1.0, "x1={}", d.x1);
+        assert!((d.y1 - 553.8).abs() < 1.0, "y1={}", d.y1);
+        assert!((d.x2 - 2396.4).abs() < 1.0, "x2={}", d.x2);
+        assert!((d.y2 - 1792.2).abs() < 1.0, "y2={}", d.y2);
     }
 
     #[test]
@@ -1141,16 +1185,18 @@ names:
     }
 
     #[test]
-    fn seg_e2e_normalized_coords_scale_to_image_dimensions() {
-        // e2e segmenter with normalized [0,1] xyxy (NMS-free YOLOv10 style).
+    fn seg_e2e_normalized_coords_are_letterbox_over_640() {
+        // e2e segmenters (yolov10s / static fine-tunes) emit normalized
+        // [0,1] xyxy relative to the 640x640 letterbox input, so decoding
+        // is `v * 640 -> (v - pad) / scale`, not `v * orig_dim`.
         // rows must be > cols so this is recognized as "end-to-end"
         // (real e2e seg exports look like [300, 38]).
         let mut boxes = Array2::<f32>::zeros((40, 38));
 
-        boxes[[0, 0]] = 0.11;
-        boxes[[0, 1]] = 0.21;
-        boxes[[0, 2]] = 0.61;
-        boxes[[0, 3]] = 0.81;
+        boxes[[0, 0]] = 0.25;
+        boxes[[0, 1]] = 0.25;
+        boxes[[0, 2]] = 0.65;
+        boxes[[0, 3]] = 0.75;
         boxes[[0, 4]] = 0.9;
         boxes[[0, 5]] = 3.0;
         for i in 0..32 {
@@ -1159,376 +1205,57 @@ names:
 
         boxes[[1, 4]] = 0.02; // below threshold
 
+        // 1280x720 frame letterboxed to 640x640: scale 0.5, pad_x 0, pad_y 140.
         let dets = parse_seg_output(boxes.view(), CONF, 1280, 720, 0.5, 0, 140)
             .expect("normalized e2e seg layout should parse");
 
         assert_eq!(dets.len(), 1);
         let d = &dets[0];
         assert_eq!(d.class_id, 3);
-        assert!((d.x1 - 0.11 * 1280.0).abs() < 1e-3);
-        assert!((d.y1 - 0.21 * 720.0).abs() < 1e-3);
-        assert!((d.x2 - 0.61 * 1280.0).abs() < 1e-3);
-        assert!((d.y2 - 0.81 * 720.0).abs() < 1e-3);
+        // letterbox coords: [160, 160, 416, 480]
+        assert!((d.x1 - 160.0 / 0.5).abs() < 1e-3); // 320
+        assert!((d.y1 - (160.0 - 140.0) / 0.5).abs() < 1e-3); // 40
+        assert!((d.x2 - 416.0 / 0.5).abs() < 1e-3); // 832
+        assert!((d.y2 - (480.0 - 140.0) / 0.5).abs() < 1e-3); // 680
         let coeffs = d.mask_coefficients.expect("coefficients present");
         assert!((coeffs[7] - 3.5).abs() < 1e-6);
     }
 
-    /// TEMP DIAGNOSTIC: dump declared output shapes of every model in models/,
-    /// then run them on a real video frame and print top detections with the
-    /// active parse logic. Run with `cargo test diagnose_real_models -- --nocapture`.
     #[test]
-    fn diagnose_real_models_on_real_image() {
-        let frame_path = "../deployment/input_images/A260807_185238_185252.avi";
-        let video_path = Path::new(frame_path);
-        if !video_path.exists() {
-            eprintln!("no video for diagnosis, skipping");
-            return;
+    fn seg_e2e_pixel_coords_unletterbox_like_raw_outputs() {
+        // Real-world check with measured numbers from screenshot.png
+        // (3840x2182): YOLO26n-seg-motion reports the person as
+        // [313.9, 230.3, 399.4, 436.7] in letterbox-pixel space; the
+        // letterbox-space COCO seg model reports
+        // [313.7, 231.2, 400.5, 437.7] for the same person. The e2e pixel
+        // box must un-letterbox to the same original-space box.
+        let mut boxes = Array2::<f32>::zeros((40, 38));
+
+        boxes[[0, 0]] = 313.9;
+        boxes[[0, 1]] = 230.3;
+        boxes[[0, 2]] = 399.4;
+        boxes[[0, 3]] = 436.7;
+        boxes[[0, 4]] = 0.97;
+        boxes[[0, 5]] = 0.0;
+        for i in 0..32 {
+            boxes[[0, 6 + i]] = i as f32 * 0.25;
         }
 
-        // Extract one real frame (skip first 30 frames, keep the 30th).
-        let mut decoder = match video_rs::decode::Decoder::new(video_path) {
-            Ok(d) => d,
-            Err(e) => panic!("decoder: {e}"),
-        };
-        let frame = decoder
-            .decode_iter()
-            .nth(30)
-            .and_then(|r| r.ok())
-            .map(|(_, arr)| arr)
-            .unwrap_or_else(|| panic!("no frame"));
+        boxes[[1, 4]] = 0.40; // below threshold
 
-        let h = frame.shape()[0] as u32;
-        let w = frame.shape()[1] as u32;
-        let mut rgb = image::RgbImage::new(w, h);
+        // 3840x2182: scale 1/6, pad_x 0, pad_y 138.
+        let dets = parse_seg_output(boxes.view(), CONF, 3840, 2182, 1.0 / 6.0, 0, 138)
+            .expect("pixel e2e seg layout should parse");
 
-        for y in 0..h {
-            for x in 0..w {
-                rgb.put_pixel(
-                    x,
-                    y,
-                    image::Rgb([
-                        frame[[y as usize, x as usize, 0]],
-                        frame[[y as usize, x as usize, 1]],
-                        frame[[y as usize, x as usize, 2]],
-                    ]),
-                );
-            }
-        }
-
-        let prep = preprocess_frame(&DynamicImage::ImageRgb8(rgb), 640);
-        eprintln!(
-            "frame {}x{} -> scale {} pad {}x{}",
-            prep.orig_w, prep.orig_h, prep.scale, prep.pad_x, prep.pad_y
-        );
-
-        let models = [
-            "models/yolo26n.onnx",
-            "models/yolo26n-seg.onnx",
-            "models/yolov10s-instar-motion-19-750e.onnx",
-            "models/YOLO26n-seg-motion-600e-18062026.onnx",
-            "models/YOLO26n-seg-static-600e-13062026.onnx",
-            "models/YOLO26s-static-600e-09062026.onnx",
-        ];
-
-        for path in models {
-            if !Path::new(path).exists() {
-                eprintln!("\n== {path}: MISSING");
-                continue;
-            }
-
-            let model = match load_model(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("\n== {path}: load failed: {e}");
-                    continue;
-                }
-            };
-
-            eprintln!("\n== {path}");
-
-            // Run on the real frame.
-            let run = model.run(tvec!(prep.input_tensor.clone().into()));
-
-            if let Err(e) = &run {
-                eprintln!("   RUN FAILED: {e}");
-                continue;
-            }
-
-            let out = run.unwrap();
-
-            for (i, t) in out.iter().enumerate() {
-                let shape: Vec<usize> = t.shape().iter().map(|d| *d).collect();
-                eprintln!("   out[{i}] shape = {shape:?}");
-            }
-
-            // And the detections our own pipeline produces.
-            if path.contains("-seg") {
-                if let Ok(seg) = run_seg_inference(
-                    &model,
-                    prep.input_tensor.clone(),
-                    0.05,
-                    prep.orig_w,
-                    prep.orig_h,
-                    prep.scale,
-                    prep.pad_x,
-                    prep.pad_y,
-                ) {
-                    let mut sorted_dets: Vec<&Detection> = seg.detections.iter().collect();
-                    sorted_dets.sort_by(|a, b| {
-                        b.score
-                            .partial_cmp(&a.score)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let top5: Vec<String> = sorted_dets
-                        .iter()
-                        .take(5)
-                        .map(|d| {
-                            format!(
-                                "cls{} {:.2} box[{} {} {} {}] coeffs={}",
-                                d.class_id,
-                                d.score,
-                                d.x1, d.y1, d.x2, d.y2,
-                                d.mask_coefficients.is_some()
-                            )
-                        })
-                        .collect();
-                    eprintln!("   SEG DETS({}): {top5:?}", seg.detections.len());
-                    eprintln!(
-                        "   proto {:?}: max={:.4}",
-                        seg.proto_masks.shape(),
-                        seg.proto_masks.iter().cloned().fold(f32::MIN, f32::max)
-                    );
-                } else {
-                    eprintln!("   SEG parse failed");
-                }
-            } else {
-                match run_od_inference(
-                    &model,
-                    prep.input_tensor.clone(),
-                    0.05,
-                    prep.orig_w,
-                    prep.orig_h,
-                    prep.scale,
-                    prep.pad_x,
-                    prep.pad_y,
-                ) {
-                    Ok(dets) => {
-                        let mut sorted_dets: Vec<&Detection> = dets.iter().collect();
-                        sorted_dets.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        let top5: Vec<String> = sorted_dets
-                            .iter()
-                            .take(5)
-                            .map(|d| {
-                                format!(
-                                    "cls{} {:.2} box[{} {} {} {}]",
-                                    d.class_id, d.score, d.x1, d.y1, d.x2, d.y2
-                                )
-                            })
-                            .collect();
-                        eprintln!("   OD DETS({}): {top5:?}", dets.len());
-                    }
-                    Err(e) => eprintln!("   OD parse failed: {e}"),
-                }
-            }
-        }
-    }
-
-    /// TEMP DIAGNOSTIC: dump raw output rows of the yolov10s motion model to
-    /// check the true column layout (are there non-degenerate boxes at all?).
-    #[test]
-    fn diagnose_yolov10s_raw_rows() {
-        let video = Path::new("../deployment/input_images/A260807_185238_185252.avi");
-        if !video.exists() {
-            return;
-        }
-        let (_, frame) = find_motion_pixel(video, 3, -1, 5, 10).unwrap();
-        let prep = preprocess_frame(&frame, 640);
-        let model = load_model("models/yolov10s-instar-motion-19-750e.onnx").unwrap();
-        let out = model.run(tvec!(prep.input_tensor.clone().into())).unwrap();
-        let base = out[0].to_array_view::<f32>().unwrap();
-        let arr = base
-            .index_axis(Axis(0), 0)
-            .into_dimensionality::<Ix2>()
-            .unwrap();
-
-        let (rows, cols) = (arr.shape()[0], arr.shape()[1]);
-        eprintln!("yolov10s raw output: {rows}x{cols}");
-
-        // Rows sorted by column 4 (assumed score).
-        let mut idx: Vec<usize> = (0..rows).collect();
-        idx.sort_by(|a, b| {
-            arr[[*b, 4]]
-                .partial_cmp(&arr[[*a, 4]])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut non_degenerate = 0u32;
-        for i in 0..rows {
-            let area = (arr[[i, 2]] - arr[[i, 0]]) * (arr[[i, 3]] - arr[[i, 1]]);
-            if area > 100.0 {
-                non_degenerate += 1;
-            }
-        }
-        eprintln!("rows with box area > 100 (xyxy interpretation): {non_degenerate}");
-
-        // Also try the hypothesis that it is cx, cy, w, h.
-        let mut non_degenerate_cx = 0u32;
-        for i in 0..rows {
-            let area = arr[[i, 2]].abs() * arr[[i, 3]].abs();
-            if area > 100.0 {
-                non_degenerate_cx += 1;
-            }
-        }
-        eprintln!("rows with w*h > 100 (cx,cy,w,h interpretation): {non_degenerate_cx}");
-
-        eprintln!("top 15 rows by col4:");
-        for &i in idx.iter().take(15) {
-            let row: Vec<f32> = (0..cols).map(|c| arr[[i, c]]).collect();
-            eprintln!("   row {i}: {row:?}");
-        }
-
-        eprintln!("\n10 random middle rows:");
-        for &i in idx.iter().skip(rows / 2).take(10) {
-            let row: Vec<f32> = (0..cols).map(|c| arr[[i, c]]).collect();
-            eprintln!("   row {i}: {row:?}");
-        }
-    }
-
-    /// TEMP DIAGNOSTIC: replicate the app's exact video path
-    /// (find motion frame -> preprocess -> inference) and report detections
-    /// from the non-COCO models. Run with `--nocapture`.
-    #[test]
-    fn diagnose_motion_models_on_motion_frames() {
-        let videos = [
-            "../deployment/input_images/A_2026-09-28_04-10-14.mp4",
-            "../deployment/input_images/A260807_185238_185252.avi",
-        ];
-        // (path, is_seg)
-        let models: [(&str, bool); 4] = [
-            ("models/yolov10s-instar-motion-19-750e.onnx", false),
-            ("models/YOLO26n-seg-motion-600e-18062026.onnx", true),
-            ("models/YOLO26n-seg-static-600e-13062026.onnx", true),
-            ("models/YOLO26s-static-600e-09062026.onnx", false),
-        ];
-
-        for video in videos {
-            let path = Path::new(video);
-            if !path.exists() {
-                eprintln!("skip missing {video}");
-                continue;
-            }
-
-            let (boxes, frame) = match find_motion_pixel(path, 3, -1, 5, 10) {
-                Some(v) => v,
-                None => {
-                    eprintln!("{video}: no motion frame found");
-                    continue;
-                }
-            };
-
-            let prep = preprocess_frame(&frame, 640);
-            eprintln!(
-                "\n== {video}: frame {}x{} with {} motion region(s); scale {} pad {}x{}",
-                prep.orig_w,
-                frame.height(),
-                boxes.len(),
-                prep.scale,
-                prep.pad_x,
-                prep.pad_y
-            );
-
-            for (model_path, is_seg) in models {
-                if !Path::new(model_path).exists() {
-                    continue;
-                }
-
-                let model = match load_model(model_path) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("  {model_path}: load failed: {e}");
-                        continue;
-                    }
-                };
-
-                let name = Path::new(model_path).file_stem().unwrap().to_string_lossy();
-
-                if is_seg {
-                    match run_seg_inference(
-                        &model,
-                        prep.input_tensor.clone(),
-                        0.05,
-                        prep.orig_w,
-                        prep.orig_h,
-                        prep.scale,
-                        prep.pad_x,
-                        prep.pad_y,
-                    ) {
-                        Ok(seg) => {
-                            let mut d: Vec<&Detection> = seg.detections.iter().collect();
-                            d.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let top5: Vec<String> = d
-                                .iter()
-                                .take(5)
-                                .map(|x| {
-                                    format!(
-                                        "cls{} {:.2} [{} {} {} {}] c={}",
-                                        x.class_id,
-                                        x.score,
-                                        x.x1,
-                                        x.y1,
-                                        x.x2,
-                                        x.y2,
-                                        x.mask_coefficients.is_some()
-                                    )
-                                })
-                                .collect();
-                            eprintln!("  {name}: {top5:?}");
-                        }
-                        Err(e) => eprintln!("  {name}: parse failed: {e}"),
-                    }
-                } else {
-                    match run_od_inference(
-                        &model,
-                        prep.input_tensor.clone(),
-                        0.05,
-                        prep.orig_w,
-                        prep.orig_h,
-                        prep.scale,
-                        prep.pad_x,
-                        prep.pad_y,
-                    ) {
-                        Ok(dets) => {
-                            let mut d: Vec<&Detection> = dets.iter().collect();
-                            d.sort_by(|a, b| {
-                                b.score
-                                    .partial_cmp(&a.score)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            let top5: Vec<String> = d
-                                .iter()
-                                .take(5)
-                                .map(|x| {
-                                    format!(
-                                        "cls{} {:.2} [{} {} {} {}]",
-                                        x.class_id, x.score, x.x1, x.y1, x.x2, x.y2
-                                    )
-                                })
-                                .collect();
-                            eprintln!("  {name}: {top5:?}");
-                        }
-                        Err(e) => eprintln!("  {name}: parse failed: {e}"),
-                    }
-                }
-            }
-        }
+        assert_eq!(dets.len(), 1);
+        let d = &dets[0];
+        // Expected original space: x [1883.4, 2396.4], y [553.8, 1792.2]
+        assert!((d.x1 - 1883.4).abs() < 1.0, "x1={}", d.x1);
+        assert!((d.y1 - 553.8).abs() < 1.0, "y1={}", d.y1);
+        assert!((d.x2 - 2396.4).abs() < 1.0, "x2={}", d.x2);
+        assert!((d.y2 - 1792.2).abs() < 1.0, "y2={}", d.y2);
+        let coeffs = d.mask_coefficients.expect("coefficients present");
+        assert!((coeffs[7] - 7 as f32 * 0.25).abs() < 1e-6);
     }
 
     /// Runs the real ONNX models (whatever is present in `models/`) through
