@@ -8,7 +8,7 @@ a lightweight Rust core (`src-tauri`) does all the heavy lifting, and a React 19
 
 ![INSTAR Object Detector UI screenshot](./public/INSTAR_Object_Detector_02.webp)
 
-> The UI let's you select both a e.g. YOLOv10 or YOLO26 object detection and segmentation model and batch runs all you input videos through them in paralell. The `teal coloured` are areas where motion was detected. The rest are bounding boxes and segmentation masks for detected objects.
+> The UI let's you select both a e.g. YOLOv10 or YOLO26 object detection and segmentation model and batch runs all you input videos through them in paralell. The `teal coloured boxes` are areas where motion was detected. The rest are bounding boxes and segmentation masks for detected objects.
 
 ## I. Introduction
 
